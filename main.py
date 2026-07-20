@@ -1,3 +1,8 @@
+import os
+# Suppress MediaPipe and TensorFlow Lite C++ log warnings
+os.environ['GLOG_minloglevel'] = '3'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 import sys
 import cv2
 import numpy as np
