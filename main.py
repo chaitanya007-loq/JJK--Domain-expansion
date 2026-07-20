@@ -1,22 +1,3 @@
-"""
-main.py — JJK Domain Expansion — Optimised Entry Point
-
-Performance Architecture
-------------------------
-  CaptureThread   → reads webcam frames continuously (non-blocking for main)
-  InferenceThread → runs MediaPipe at 640×360 in parallel (non-blocking)
-  Main loop       → compositing + effects only (fast CPU ops, targets 30–60 FPS)
-  VideoPreloader  → both domain videos loaded into RAM at startup
-  AudioPlayer     → all audio assets preloaded at startup (instant triggers)
-
-Controls
---------
-  G   → Trigger Gojo  "Unlimited Void"
-  S   → Trigger Sukuna "Malevolent Shrine"
-  D   → Toggle debug overlay
-  ESC → Close domain / quit
-"""
-
 import sys
 import cv2
 import numpy as np
@@ -31,21 +12,16 @@ from gesture.detector       import HandDetector
 from gesture.recognizer     import GestureRecognizer
 from domains.manager        import DomainManager
 from audio.player           import AudioPlayer
+from effects.particles      import ParticleSystem
 from utils.timer            import FPSCounter, Profiler
 from utils.helpers          import draw_hud_text, draw_cooldown_bar, add_vignette
 from utils.logger           import get_logger
 
 log = get_logger(__name__)
 
-
-# ─── Pre-allocated empty mask ─────────────────────────────────────────────────
-# Returned when no inference result is available yet (first ~0.1s)
 _EMPTY_MASK = np.zeros(
-    (config.CAMERA_HEIGHT, config.CAMERA_WIDTH), dtype=np.uint8
+    (config.CAMERA_HEIGHT, config.CAMERA_WIDTH), dtype=np.float32
 )
-
-
-# ─── HUD ──────────────────────────────────────────────────────────────────────
 
 def _draw_hud(
     frame:          np.ndarray,
@@ -56,17 +32,15 @@ def _draw_hud(
     time_remaining: float,
     cooldown_prog:  float,
     cooldown_ready: bool,
-    gesture_prog:   tuple,          # (name | None, 0.0–1.0)
+    gesture_prog:   tuple,
     debug_info:     dict,
     debug_mode:     bool,
 ) -> np.ndarray:
     h, w = frame.shape[:2]
 
-    # FPS counter (top-left)
     hud_text = f"Avg FPS: {avg_fps:.1f} | Instant FPS: {curr_fps:.1f} | Latency: {frame_time:.1f}ms"
     draw_hud_text(frame, hud_text, (15, 30),
                   color=(200, 255, 200), scale=0.5, thickness=1)
-
 
     if domain_name:
         banner = "UNLIMITED VOID" if domain_name == "gojo" else "MALEVOLENT SHRINE"
@@ -75,7 +49,6 @@ def _draw_hud(
         (tw, _), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2)
         cx = (w - tw) // 2
 
-        # Semi-transparent strip
         strip = frame.copy()
         cv2.rectangle(strip, (0, h - 80), (w, h - 45), (0, 0, 0), -1)
         cv2.addWeighted(strip, 0.5, frame, 0.5, 0, frame)
@@ -96,7 +69,6 @@ def _draw_hud(
                 draw_hud_text(frame, f"[{key}] {name}",
                               (w - 140, 30 + i * 25), col, 0.55)
 
-        # ── Gesture progress bar ──────────────────────────────────────
         g_name, g_prog = gesture_prog
         if g_name and g_prog > 0.0:
             g_col = config.GOJO_AURA_COLOR if g_name == "gojo" else config.SUKUNA_AURA_COLOR
@@ -107,19 +79,15 @@ def _draw_hud(
             x_off  = (w - bar_w) // 2
             y_off  = h - 60
 
-            # Background track
             cv2.rectangle(frame, (x_off, y_off), (x_off + bar_w, y_off + bar_h),
                           (30, 30, 30), -1)
-            # Fill
             fill_w = int(bar_w * g_prog)
             if fill_w > 0:
                 cv2.rectangle(frame, (x_off, y_off), (x_off + fill_w, y_off + bar_h),
                               g_col, -1)
-            # Border
             cv2.rectangle(frame, (x_off, y_off), (x_off + bar_w, y_off + bar_h),
                           (150, 150, 150), 1)
 
-            # Label above bar
             draw_hud_text(frame,
                           f"{g_label} gesture detected... hold it!",
                           (x_off, y_off - 10),
@@ -133,9 +101,6 @@ def _draw_hud(
             y += 18
 
     return frame
-
-
-# ─── Idle frame (no camera) ───────────────────────────────────────────────────
 
 def _make_idle_frame(width: int, height: int, tick: int) -> np.ndarray:
     frame = np.zeros((height, width, 3), dtype=np.uint8)
@@ -151,13 +116,14 @@ def _make_idle_frame(width: int, height: int, tick: int) -> np.ndarray:
                   (cx - 230, cy + 20), (140, 140, 180), 0.6, 1)
     return frame
 
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
+def _mask_to_uint8(mask: np.ndarray) -> np.ndarray:
+    if mask.dtype == np.float32 or mask.dtype == np.float64:
+        return (mask * 255.0).clip(0, 255).astype(np.uint8)
+    return mask
 
 def main():
     log.info("=== JJK Domain Expansion starting ===")
 
-    # ── Subsystem creation ────────────────────────────────────────────────────
     cam         = Webcam()
     bg_remover  = BackgroundRemover()
     detector    = HandDetector()
@@ -165,12 +131,14 @@ def main():
     audio       = AudioPlayer()
     fps_counter = FPSCounter(window=30)
 
-    # ── Startup init ──────────────────────────────────────────────────────────
     audio.start()
-    audio.preload_all()     # load all wav/mp3 into RAM now (not at trigger time)
+    audio.preload_all()
 
-    bg_remover.start()      # load TFLite segmentation model
-    detector.start()        # load hand landmark model
+    bg_remover.start()
+    detector.start()
+
+    if config.PARTICLE_WARM_UP_AT_START:
+        ParticleSystem.warm_up()
 
     cam_ok = cam.open()
     if not cam_ok:
@@ -179,11 +147,8 @@ def main():
     W = cam.width  if cam_ok else config.CAMERA_WIDTH
     H = cam.height if cam_ok else config.CAMERA_HEIGHT
 
-    # Domain manager creates GojoDomain + SukunaDomain, which start video
-    # preloading immediately in their own background threads.
     manager = DomainManager(audio)
 
-    # ── Background threads ────────────────────────────────────────────────────
     capture_thread   = CaptureThread(cam)
     inference_thread = InferenceThread(bg_remover, detector)
 
@@ -194,7 +159,6 @@ def main():
 
     profiler = Profiler()
 
-    # ── Window ────────────────────────────────────────────────────────────────
     flags = cv2.WINDOW_NORMAL
     cv2.namedWindow(config.WINDOW_NAME, flags)
     if config.FULLSCREEN:
@@ -204,6 +168,11 @@ def main():
     debug_mode = False
     tick       = 0
 
+    throttle_active       = False
+    throttle_frame_count  = 0
+    cached_mask           = _EMPTY_MASK.copy()
+    MASK_REFRESH_INTERVAL = config.THROTTLE_MASK_REFRESH_INTERVAL
+
     log.info("Main loop started. Controls: G=Gojo  S=Sukuna  D=Debug  ESC=Quit")
 
     try:
@@ -211,7 +180,6 @@ def main():
             tick += 1
             fps_counter.tick()
 
-            # ── 1. Grab latest camera frame (non-blocking) ────────────────────
             profiler.start("camera_capture")
             if cam_ok:
                 frame = capture_thread.get_latest_frame()
@@ -219,73 +187,107 @@ def main():
                 frame = None
             profiler.stop("camera_capture")
 
-            # ── 2 & 3. Submit and retrieve inference result ────────────────────
             profiler.start("segmentation")
             if frame is None:
-                # No camera or not yet captured → show idle animation
                 frame        = _make_idle_frame(W, H, tick)
                 person_mask  = _EMPTY_MASK
                 hands        = []
                 gesture_prog = (None, 0.0)
             else:
-                inference_thread.submit_frame(frame, W, H)
-                person_mask, hands = inference_thread.get_result()
-                if person_mask is None:
-                    person_mask = _EMPTY_MASK
+                if throttle_active:
+                    throttle_frame_count += 1
+                    if throttle_frame_count >= MASK_REFRESH_INTERVAL:
+                        inference_thread.submit_frame(frame, W, H)
+                        person_mask, _ = inference_thread.get_result()
+                        if person_mask is not None:
+                            cached_mask = person_mask
+                        else:
+                            person_mask = cached_mask
+                        throttle_frame_count = 0
+                    else:
+                        person_mask = cached_mask
+                    hands = []
+                else:
+                    inference_thread.submit_frame(frame, W, H)
+                    person_mask, hands = inference_thread.get_result()
+                    if person_mask is None:
+                        person_mask = _EMPTY_MASK
+                    else:
+                        cached_mask = person_mask
             profiler.stop("segmentation")
 
-            # ── 4. Gesture recognition ────────────────────────────────────────
             profiler.start("gesture_recognition")
-            gesture      = recognizer.recognize(hands)
-            gesture_prog = recognizer.progress()   # (name|None, 0.0–1.0)
-            if gesture and config.KEYBOARD_TRIGGER_ENABLED:
-                manager.trigger(gesture)
+            if throttle_active:
+                gesture      = None
+                gesture_prog = (None, 0.0)
+            else:
+                gesture      = recognizer.recognize(hands)
+                gesture_prog = recognizer.progress()
+                if gesture and config.KEYBOARD_TRIGGER_ENABLED:
+                    manager.trigger(gesture)
             profiler.stop("gesture_recognition")
 
-            # ── 5. Domain lifecycle ───────────────────────────────────────────
             manager.update()
             domain = manager.active_domain
+            curr_active = domain is not None
 
-            # ── 6. Compositing + Effects ──────────────────────────────────────
+            if curr_active and not throttle_active:
+                throttle_active      = True
+                throttle_frame_count = 0
+                inference_thread.set_mode("seg_only")
+                log.info("Dynamic AI Throttling: ACTIVE (hand tracking disabled)")
+            elif not curr_active and throttle_active:
+                throttle_active = False
+                inference_thread.set_mode("full")
+                log.info("Dynamic AI Throttling: INACTIVE (full inference resumed)")
+
+            person_mask_u8 = _mask_to_uint8(person_mask)
+
             if domain:
                 profiler.start("video_playback")
                 bg_frame  = domain.get_bg_frame(W, H)
                 intensity = domain.intensity
                 profiler.stop("video_playback")
 
-                # User over domain background
+                tint_color = None
+                if manager.active_name == "gojo":
+                    tint_color = config.GOJO_AURA_COLOR
+                elif manager.active_name == "sukuna":
+                    tint_color = config.SUKUNA_AURA_COLOR
+
                 profiler.start("compositing")
-                frame = Overlay.composite(frame, person_mask, bg_frame)
+                frame = Overlay.composite(frame, person_mask, bg_frame,
+                                          tint_color=tint_color,
+                                          tint_strength=0.12)
                 profiler.stop("compositing")
 
-                # Impact sequence (first few frames of activation)
                 frame = domain.burst.apply(frame)
                 frame = domain.flash.apply(frame)
 
-                # Continuous effects (environmental lighting & cinematic rim glow)
                 profiler.start("aura_rendering")
-                frame = domain.aura.apply(frame, person_mask, intensity)
+                frame = domain.aura.apply(frame, person_mask_u8, intensity)
                 profiler.stop("aura_rendering")
 
                 profiler.start("particle_rendering")
-                frame = domain.particles.update_and_draw(frame, person_mask,
+                frame = domain.particles.update_and_draw(frame, person_mask_u8,
                                                          intensity)
                 profiler.stop("particle_rendering")
 
                 frame = domain.shake.apply(frame)
                 frame = add_vignette(frame, strength=0.6)
             else:
-                # Clear active domain durations when domain is idle
                 for key in ["video_playback", "compositing", "aura_rendering", "particle_rendering"]:
                     profiler.durations[key] = 0.0
                 frame = add_vignette(frame, strength=0.35)
 
-            # ── 7. HUD ────────────────────────────────────────────────────────
             debug_info = recognizer.debug_info(hands) if debug_mode else {}
             if debug_mode:
-                # Inject performance metrics into the debug panel
                 for key, val in profiler.durations.items():
                     debug_info[f"CPU_{key}_ms"] = f"{val:.2f}"
+                debug_info["throttle_mode"] = "ACTIVE" if throttle_active else "idle"
+                if throttle_active:
+                    debug_info["mask_refresh_in"] = f"{MASK_REFRESH_INTERVAL - throttle_frame_count} frames"
+                debug_info["compositor"] = "GPU (CuPy)" if BackgroundRemover._HAS_CUPY else "CPU (NumPy)"
 
             frame = _draw_hud(
                 frame,
@@ -300,15 +302,14 @@ def main():
                 debug_info     = debug_info,
                 debug_mode     = debug_mode,
             )
-            # ── 8. Display ────────────────────────────────────────────────────
+
             profiler.start("final_display")
             cv2.imshow(config.WINDOW_NAME, frame)
             profiler.stop("final_display")
 
-            # ── 9. Input (1 ms wait — nearly non-blocking) ────────────────────
             key = cv2.waitKey(1) & 0xFF
 
-            if key == 27:                               # ESC
+            if key == 27:
                 if domain:
                     manager.close_domain()
                 else:
@@ -327,10 +328,8 @@ def main():
                 log.info(f"Debug mode: {'ON' if debug_mode else 'OFF'}")
 
     except KeyboardInterrupt:
-        pass   # clean shutdown below
+        pass
     finally:
-        # Robust shutdown — each step guarded so one failure doesn't
-        # prevent the others from running.
         for step_name, step_fn in [
             ("close domain",     manager.close_domain),
             ("stop inference",   inference_thread.stop),
@@ -348,7 +347,5 @@ def main():
 
         sys.stdout.write("=== Bye! ===\n")
 
-
-# ─── Entry ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()

@@ -6,14 +6,15 @@ DomainVideoPlayer
   Preloads domain video frames into RAM in a background thread the moment
   the object is created. next_frame() never blocks on disk I/O.
 
-  Storage: frames at INFERENCE_WIDTH × INFERENCE_HEIGHT (640×360) with
+  Storage: frames at CAMERA_WIDTH × CAMERA_HEIGHT with
   tint applied once at load time. next_frame(w,h) does a fast bilinear
   resize to display resolution.
 
 Overlay
 -------
-  Composites the user silhouette over the domain background using a
-  pre-allocated output buffer to avoid per-frame memory allocation.
+  Composites the user silhouette over the domain background using the
+  GPU-accelerated compositor from ``camera.background`` (with CPU fallback).
+  Supports optional ambient color grading via the ``tint_color`` parameter.
 """
 
 import os
@@ -22,6 +23,7 @@ import cv2
 import numpy as np
 
 import config
+from camera.background import composite_frames
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -141,11 +143,10 @@ class DomainVideoPlayer:
 class Overlay:
     """
     Composites the user silhouette over a domain background frame.
-    Uses a class-level pre-allocated output buffer to avoid per-frame malloc.
-    """
 
-    _out_buf:   np.ndarray | None = None
-    _buf_shape: tuple             = ()
+    Delegates to the GPU/CPU compositor in ``camera.background`` for
+    alpha blending with optional ambient color grading.
+    """
 
     @classmethod
     def composite(
@@ -153,15 +154,19 @@ class Overlay:
         user_frame:   np.ndarray,
         person_mask:  np.ndarray,
         domain_frame: np.ndarray,
+        tint_color:   tuple | None = None,
+        tint_strength: float = 0.12,
     ) -> np.ndarray:
         """
         Alpha-blend the user over the domain background using person_mask.
 
         Parameters
         ----------
-        user_frame   : BGR webcam frame
-        person_mask  : uint8 H×W (255=person, 0=background)
-        domain_frame : BGR domain background, any size (resized internally)
+        user_frame    : BGR webcam frame
+        person_mask   : H×W mask — float32 [0,1] (soft) or uint8 0/255
+        domain_frame  : BGR domain background, any size (resized internally)
+        tint_color    : optional (B,G,R) for ambient lighting colour grading
+        tint_strength : 0.0–1.0 intensity of the tint
 
         Returns
         -------
@@ -174,20 +179,19 @@ class Overlay:
             domain_frame = cv2.resize(domain_frame, (w, h),
                                       interpolation=cv2.INTER_LINEAR)
 
-        # Pre-allocate output buffer (only once, or when size changes)
-        if cls._buf_shape != (h, w):
-            cls._out_buf  = np.empty((h, w, 3), dtype=np.float32)
-            cls._buf_shape = (h, w)
+        # Convert uint8 mask to float32 if needed
+        if person_mask.dtype == np.uint8:
+            soft_mask = person_mask.astype(np.float32) / 255.0
+        else:
+            soft_mask = person_mask
 
-        # Use soft contrast mask thresholding (contrasts feathered edge, removes halo)
-        alpha = np.clip((person_mask.astype(np.float32) - 100.0) / 155.0, 0.0, 1.0)
-        alpha_f = alpha[:, :, np.newaxis]
+        # Ensure mask dimensions match frame
+        if soft_mask.shape[:2] != (h, w):
+            soft_mask = cv2.resize(soft_mask, (w, h),
+                                   interpolation=cv2.INTER_LINEAR)
 
-        # In-place blend into pre-allocated buffer
-        user_f   = user_frame.astype(np.float32)
-        domain_f = domain_frame.astype(np.float32)
-        np.multiply(user_f,   alpha_f,       out=cls._out_buf)
-        np.add(cls._out_buf, domain_f * (1.0 - alpha_f), out=cls._out_buf)
-        np.clip(cls._out_buf, 0, 255, out=cls._out_buf)
-
-        return cls._out_buf.astype(np.uint8)
+        return composite_frames(
+            user_frame, domain_frame, soft_mask,
+            tint_color=tint_color,
+            tint_strength=tint_strength,
+        )

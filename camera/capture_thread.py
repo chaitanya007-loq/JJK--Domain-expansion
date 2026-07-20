@@ -7,7 +7,8 @@ main render loop never blocks on I/O or camera latency.
 
 import threading
 import numpy as np
-from utils.logger import get_logger
+from utils.logger import get_logger 
+import config
 
 log = get_logger(__name__)
 

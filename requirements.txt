@@ -3,3 +3,8 @@ mediapipe>=0.10.30
 numpy>=1.24.0
 pygame>=2.5.0
 Pillow>=10.0.0
+numba>=0.59.0
+# Optional: GPU-accelerated compositing (NVIDIA CUDA only).
+# Install the package matching your CUDA version:
+#   pip install cupy-cuda12x>=13.0.0   (for CUDA 12.x)
+#   pip install cupy-cuda11x>=12.0.0   (for CUDA 11.x)

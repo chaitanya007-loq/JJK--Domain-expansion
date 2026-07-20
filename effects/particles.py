@@ -1,49 +1,101 @@
-"""
-effects/particles.py — Energy particle system that orbits the user silhouette.
-
-Each particle is born near the silhouette edge, moves outward with some
-random velocity, fades over its lifetime, and is recycled when it dies.
-"""
-
 import cv2
 import numpy as np
-from dataclasses import dataclass, field
-from typing import List
+import numba
+from numba import njit, prange
 
 import config
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
+@njit(cache=True)
+def _update_particles_kernel(
+    x, y, vx, vy, life, max_life, alive,
+    gravity: float, drag: float,
+    w: int, h: int,
+):
+    n = x.shape[0]
+    alpha = np.zeros(n, dtype=np.float64)
+    alive_count = 0
 
-# ─── Particle data ────────────────────────────────────────────────────────────
+    for i in range(n):
+        if alive[i] == 0:
+            continue
 
-@dataclass
-class Particle:
-    x:        float = 0.0
-    y:        float = 0.0
-    vx:       float = 0.0
-    vy:       float = 0.0
-    radius:   int   = 3
-    life:     int   = 0      # current age (frames)
-    max_life: int   = config.PARTICLE_LIFETIME
-    color:    tuple = (255, 255, 255)   # BGR
+        x[i]  += vx[i]
+        y[i]  += vy[i]
+        vy[i] -= gravity
+        vx[i] *= drag
+        life[i] += 1
 
+        if life[i] >= max_life[i] or x[i] < 0 or x[i] >= w or y[i] < 0 or y[i] >= h:
+            alive[i] = 0
+            continue
 
-# ─── System ───────────────────────────────────────────────────────────────────
+        alive_count += 1
+        t = life[i] / max_life[i]
+        alpha[i] = np.sin(t * np.pi)
+
+    return alpha, alive_count
+
+@njit(cache=True, parallel=True)
+def _render_particles_kernel(
+    out,
+    x, y, radius, alive, alpha,
+    color_b: int, color_g: int, color_r: int,
+    intensity: float,
+):
+    h = out.shape[0]
+    w = out.shape[1]
+    n = x.shape[0]
+
+    for idx in prange(n):
+        if alive[idx] == 0 or alpha[idx] < 0.05:
+            continue
+
+        a  = alpha[idx] * intensity
+        cx = int(x[idx])
+        cy = int(y[idx])
+        r  = int(radius[idx])
+
+        x1 = max(0, cx - r)
+        x2 = min(w - 1, cx + r)
+        y1 = max(0, cy - r)
+        y2 = min(h - 1, cy + r)
+        r2 = r * r
+
+        for py in range(y1, y2 + 1):
+            for px in range(x1, x2 + 1):
+                dx = px - cx
+                dy = py - cy
+                if dx * dx + dy * dy <= r2:
+                    ob = out[py, px, 0]
+                    og = out[py, px, 1]
+                    orr = out[py, px, 2]
+                    nb = int(ob + color_b * a)
+                    ng = int(og + color_g * a)
+                    nr = int(orr + color_r * a)
+                    out[py, px, 0] = min(255, nb) if nb > ob else ob
+                    out[py, px, 1] = min(255, ng) if ng > og else og
+                    out[py, px, 2] = min(255, nr) if nr > orr else orr
 
 class ParticleSystem:
-    """
-    Maintains a pool of `config.PARTICLE_COUNT` particles that are spawned
-    along the person silhouette edge and drift outward.
-    """
-
+    """Manages particle pools using preallocated numpy arrays for speed."""
     def __init__(self, color: tuple = (200, 200, 255)):
-        self.color     = color
-        self._particles: List[Particle] = []
-        self._rng       = np.random.default_rng()
+        self.color = color
+        n = config.PARTICLE_COUNT
 
-    # ------------------------------------------------------------------ update + draw
+        self._x        = np.zeros(n, dtype=np.float64)
+        self._y        = np.zeros(n, dtype=np.float64)
+        self._vx       = np.zeros(n, dtype=np.float64)
+        self._vy       = np.zeros(n, dtype=np.float64)
+        self._radius   = np.full(n, 3.0, dtype=np.float64)
+        self._life     = np.zeros(n, dtype=np.float64)
+        self._max_life = np.full(n, float(config.PARTICLE_LIFETIME), dtype=np.float64)
+        self._alive    = np.zeros(n, dtype=np.int32)
+
+        self._rng      = np.random.default_rng()
+        self._capacity = n
 
     def update_and_draw(
         self,
@@ -51,105 +103,87 @@ class ParticleSystem:
         person_mask: np.ndarray,
         intensity:   float = 1.0,
     ) -> np.ndarray:
-        """
-        Spawn new particles along the mask edge, advance existing ones, and
-        render them onto `frame`.
+        h, w = frame.shape[:2]
 
-        Parameters
-        ----------
-        frame       : BGR frame to draw on (copied internally)
-        person_mask : uint8 person mask
-        intensity   : 0.0–1.0 (scales alpha and count)
-
-        Returns
-        -------
-        frame with particles drawn
-        """
-        output = frame.copy()
-        h, w   = frame.shape[:2]
-
-        # Find silhouette edge pixels as spawn candidates
         edge_px = self._get_edge_pixels(person_mask)
+        target  = int(self._capacity * max(0.0, min(1.0, intensity)))
 
-        # Spawn new particles up to the configured count
-        target_count = int(config.PARTICLE_COUNT * max(0.0, min(1.0, intensity)))
-        while len(self._particles) < target_count and len(edge_px) > 0:
-            self._particles.append(self._spawn(edge_px, h, w))
+        alive_count = int(np.sum(self._alive))
+        need = target - alive_count
+        if need > 0 and len(edge_px) > 0:
+            self._spawn_batch(edge_px, min(need, len(edge_px)), h, w)
 
-        # Update + draw each particle
-        alive = []
-        for p in self._particles:
-            p.x     += p.vx
-            p.y     += p.vy
-            p.vy    -= 0.04    # gentle upward drift (gravity reversed)
-            p.vx    *= 0.99    # drag
-            p.life  += 1
+        alpha, _ = _update_particles_kernel(
+            self._x, self._y, self._vx, self._vy,
+            self._life, self._max_life, self._alive,
+            gravity=0.04, drag=0.99,
+            w=w, h=h,
+        )
 
-            if p.life >= p.max_life or not (0 <= p.x < w and 0 <= p.y < h):
-                continue       # particle dies — will be replaced next frame
-            alive.append(p)
+        output = frame.copy()
+        _render_particles_kernel(
+            output,
+            self._x, self._y, self._radius, self._alive, alpha,
+            color_b=self.color[0], color_g=self.color[1], color_r=self.color[2],
+            intensity=float(intensity),
+        )
 
-            # Alpha fades in then out over lifetime
-            t     = p.life / p.max_life
-            alpha = np.sin(t * np.pi) * intensity   # 0 → 1 → 0
-            if alpha < 0.05:
-                continue
-
-            # Draw with local blend (faster, no full frame copy)
-            cx, cy, r = int(p.x), int(p.y), p.radius
-            # Crop bounds to avoid going outside frame edges
-            x1, y1 = max(0, cx - r), max(0, cy - r)
-            x2, y2 = min(w, cx + r + 1), min(h, cy + r + 1)
-            if x2 > x1 and y2 > y1:
-                patch = output[y1:y2, x1:x2].copy()
-                cv2.circle(patch, (cx - x1, cy - y1), r, p.color, -1)
-                cv2.addWeighted(patch, alpha, output[y1:y2, x1:x2], 1.0 - alpha, 0, dst=output[y1:y2, x1:x2])
-
-            # Small bloom ring (drawn directly on output)
-            if p.radius > 2:
-                cv2.circle(
-                    output,
-                    (cx, cy),
-                    p.radius + 2,
-                    p.color,
-                    1,
-                )
-
-        self._particles = alive
         return output
 
-    # ------------------------------------------------------------------ helpers
-
     def _get_edge_pixels(self, mask: np.ndarray) -> np.ndarray:
-        """Return (N,2) array of (x,y) edge pixel coordinates."""
         edges = cv2.Canny(mask, 30, 100)
         ys, xs = np.where(edges > 0)
         if len(xs) == 0:
-            return np.empty((0, 2), dtype=int)
+            return np.empty((0, 2), dtype=np.int64)
         return np.column_stack([xs, ys])
 
-    def _spawn(self, edge_px: np.ndarray, h: int, w: int) -> Particle:
-        """Create a new particle at a random edge pixel with random velocity."""
-        rng    = self._rng
-        idx    = rng.integers(0, len(edge_px))
-        x, y   = float(edge_px[idx, 0]), float(edge_px[idx, 1])
+    def _spawn_batch(self, edge_px: np.ndarray, count: int, h: int, w: int):
+        rng  = self._rng
+        dead = np.where(self._alive == 0)[0]
+        if len(dead) == 0:
+            return
+        slots = dead[:count]
+        n     = len(slots)
 
-        speed  = rng.uniform(config.PARTICLE_SPEED_MIN, config.PARTICLE_SPEED_MAX)
-        angle  = rng.uniform(0, 2 * np.pi)
-        vx     = np.cos(angle) * speed
-        vy     = np.sin(angle) * speed - 1.0    # bias upward
+        idx = rng.integers(0, len(edge_px), size=n)
+        self._x[slots] = edge_px[idx, 0].astype(np.float64)
+        self._y[slots] = edge_px[idx, 1].astype(np.float64)
 
-        radius = rng.integers(config.PARTICLE_RADIUS_MIN, config.PARTICLE_RADIUS_MAX + 1)
-        life   = rng.integers(0, config.PARTICLE_LIFETIME // 3)   # stagger ages
+        speed  = rng.uniform(config.PARTICLE_SPEED_MIN, config.PARTICLE_SPEED_MAX, size=n)
+        angle  = rng.uniform(0, 2.0 * np.pi, size=n)
+        self._vx[slots] = np.cos(angle) * speed
+        self._vy[slots] = np.sin(angle) * speed - 1.0
 
-        return Particle(
-            x=x, y=y, vx=vx, vy=vy,
-            radius=int(radius),
-            life=int(life),
-            max_life=config.PARTICLE_LIFETIME,
-            color=self.color,
-        )
+        self._radius[slots]   = rng.integers(
+            config.PARTICLE_RADIUS_MIN, config.PARTICLE_RADIUS_MAX + 1, size=n
+        ).astype(np.float64)
+        self._life[slots]     = rng.integers(
+            0, config.PARTICLE_LIFETIME // 3, size=n
+        ).astype(np.float64)
+        self._max_life[slots] = float(config.PARTICLE_LIFETIME)
+        self._alive[slots]    = 1
 
     def clear(self):
-        """Remove all particles (e.g., when domain ends)."""
-        self._particles.clear()
+        self._alive[:] = 0
+
+    @classmethod
+    def warm_up(cls):
+        log.info("Warming up Numba particle kernels...")
+        n = 8
+        x  = np.zeros(n, dtype=np.float64)
+        y  = np.zeros(n, dtype=np.float64)
+        vx = np.zeros(n, dtype=np.float64)
+        vy = np.zeros(n, dtype=np.float64)
+        life     = np.zeros(n, dtype=np.float64)
+        max_life = np.full(n, 10.0, dtype=np.float64)
+        alive    = np.ones(n, dtype=np.int32)
+        radius   = np.full(n, 2.0, dtype=np.float64)
+
+        _update_particles_kernel(x, y, vx, vy, life, max_life, alive,
+                                 0.04, 0.99, 64, 64)
+
+        dummy_frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        alpha = np.ones(n, dtype=np.float64) * 0.5
+        _render_particles_kernel(dummy_frame, x, y, radius, alive, alpha,
+                                 200, 200, 255, 1.0)
+        log.info("Numba particle kernels compiled OK")

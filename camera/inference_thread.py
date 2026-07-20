@@ -1,9 +1,13 @@
 """
 camera/inference_thread.py — Background MediaPipe inference thread.
 
-Added:
-- Temporal mask smoothing (flicker reduction) for clean body edges.
-- Exponential Moving Average (EMA) landmark smoothing for stable gesture tracking.
+Supports two operating modes:
+  "full"     → segmentation + hand detection  (idle / cooldown state)
+  "seg_only" → segmentation only, skip hands  (domain active — throttled)
+
+Includes:
+  - Temporal mask smoothing (flicker reduction) for clean body edges.
+  - Exponential Moving Average (EMA) landmark smoothing for stable gesture tracking.
 """
 
 import threading
@@ -21,6 +25,12 @@ log = get_logger(__name__)
 class InferenceThread(threading.Thread):
     """
     Background thread for all MediaPipe AI processing.
+
+    Modes
+    -----
+    "full"     — Run both segmentation and hand detection every submitted frame.
+    "seg_only" — Run segmentation only; return empty hand list.  Used during
+                 active domain states to save CPU (Dynamic AI Throttling).
     """
 
     def __init__(self, bg_remover, hand_detector):
@@ -42,6 +52,10 @@ class InferenceThread(threading.Thread):
 
         self._running      = False
 
+        # Operating mode
+        self._mode      = "full"   # "full" | "seg_only"
+        self._mode_lock = threading.Lock()
+
         # Temporal smoothing caches
         self._prev_mask: np.ndarray | None = None
         self._prev_hands: dict[str, list] = {}  # side -> landmark list
@@ -57,6 +71,25 @@ class InferenceThread(threading.Thread):
     def stop(self):
         self._running = False
         self._frame_event.set()
+
+    # ------------------------------------------------------------------ mode
+
+    def set_mode(self, mode: str):
+        """
+        Switch between inference modes.
+
+        Parameters
+        ----------
+        mode : "full" or "seg_only"
+        """
+        with self._mode_lock:
+            if self._mode != mode:
+                log.info(f"Inference mode → {mode}")
+                self._mode = mode
+
+    def get_mode(self) -> str:
+        with self._mode_lock:
+            return self._mode
 
     # ------------------------------------------------------------------ API
 
@@ -123,14 +156,18 @@ class InferenceThread(threading.Thread):
             if frame is None:
                 continue
 
+            # Read current mode
+            with self._mode_lock:
+                mode = self._mode
+
             try:
                 small = cv2.resize(frame, (INF_W, INF_H),
                                    interpolation=cv2.INTER_LINEAR)
 
-                # 1. Segmentation
+                # 1. Segmentation (always runs)
                 mask_small = self._bg_remover.get_mask(small)
 
-                # Upscale & blur
+                # The mask is now float32 [0,1] — upscale and blur
                 mask_full = cv2.resize(mask_small, (disp_w, disp_h),
                                        interpolation=cv2.INTER_LINEAR)
                 mask_full = cv2.GaussianBlur(mask_full, (11, 11), 0)
@@ -140,9 +177,12 @@ class InferenceThread(threading.Thread):
                     cv2.addWeighted(mask_full, 0.45, self._prev_mask, 0.55, 0, dst=mask_full)
                 self._prev_mask = mask_full.copy()
 
-                # 2. Hand tracking + EMA smoothing
-                raw_hands = self._detector.detect(small)
-                hands = self._smooth_landmarks(raw_hands)
+                # 2. Hand tracking (only in "full" mode)
+                if mode == "full":
+                    raw_hands = self._detector.detect(small)
+                    hands = self._smooth_landmarks(raw_hands)
+                else:
+                    hands = []
 
                 # Publish
                 with self._result_lock:
